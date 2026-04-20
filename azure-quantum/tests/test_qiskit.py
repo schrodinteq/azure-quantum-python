@@ -25,6 +25,7 @@ from qiskit import QuantumCircuit, transpile
 
 from azure.quantum.qiskit.job import AzureQuantumJob
 from azure.quantum.qiskit.backends.backend import QIR_BASIS_GATES
+from azure.quantum.qiskit.backends.generic import AzureGenericQirBackend
 from azure.quantum.qiskit.backends.ionq import (
     IonQSimulatorBackend,
     IonQSimulatorQirBackend,
@@ -35,8 +36,51 @@ from azure.quantum.qiskit.backends.quantinuum import (
     QuantinuumEmulatorBackend,
     QuantinuumEmulatorQirBackend,
 )
+from azure.quantum._client.models import TargetStatus
 
-from mock_client import create_default_workspace
+from mock_client import create_default_workspace, _paged
+
+from types import SimpleNamespace
+
+
+def _seed_workspace_target(
+    monkeypatch: pytest.MonkeyPatch,
+    ws,
+    *,
+    provider_id: str,
+    target_id: str,
+    num_qubits: int | None = None,
+    target_profile: str | None = None,
+) -> None:
+    """Inject a provider+target into the offline Workspace mock.
+
+    The Qiskit provider discovers targets via `Workspace._get_target_status()`,
+    which iterates `ws._client.services.providers.list()`.
+    """
+
+    # `AzureQuantumProvider.__init__` appends a user agent to the Workspace, which
+    # recreates the underlying client (and would wipe our patched providers.list).
+    # For this offline-only test, keep the existing mock client.
+    if hasattr(ws, "_connection_params") and hasattr(
+        ws._connection_params, "on_new_client_request"
+    ):
+        ws._connection_params.on_new_client_request = None
+
+    target_status = TargetStatus(
+        {
+            "id": target_id,
+            "currentAvailability": "Available",
+            "averageQueueTime": 0,
+            "numQubits": num_qubits,
+            "targetProfile": target_profile,
+        }
+    )
+    provider = SimpleNamespace(id=provider_id, targets=[target_status])
+    monkeypatch.setattr(
+        ws._client.services.providers,
+        "list",
+        lambda *args, **kwargs: _paged([provider]),
+    )
 
 
 def _patch_upload_input_data(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -127,6 +171,97 @@ def test_qir_to_qiskit_bitstring_roundtrip():
     azure_register = "[0,1,0,0,1,1]"
     assert AzureQuantumJob._qir_to_qiskit_bitstring(azure_register) == bits
     assert AzureQuantumJob._qir_to_qiskit_bitstring(bits) == bits
+
+
+def test_qir_to_qiskit_bitstring_preserves_lost_qubit_markers():
+    assert AzureQuantumJob._qir_to_qiskit_bitstring([0, 1, 2, "-"]) == "012-"
+    assert AzureQuantumJob._qir_to_qiskit_bitstring('[0, 1, 2, "-"]') == "012-"
+
+
+def test_microsoft_v1_results_raw_and_filtered_fields_handle_qubit_loss():
+    ws = create_default_workspace()
+    provider = AzureQuantumProvider(workspace=ws)
+    backend = SimpleNamespace(
+        name="dummy",
+        version="0.0",
+        provider=provider,
+        options=SimpleNamespace(shots=100),
+        configuration=lambda: SimpleNamespace(simulator=False),
+    )
+    azure_job = SimpleNamespace(
+        id="job-1",
+        details=SimpleNamespace(input_params={"shots": 100}),
+        get_results=lambda: {
+            # This outcome includes a lost-qubit marker and should be dropped from
+            # Qiskit-compatible fields.
+            "[0, 1, 2, 0]": 0.30,
+            "[0, 1, 0, 0]": 0.20,
+            "[1, 1, 0, 0]": 0.50,
+        },
+    )
+
+    job = AzureQuantumJob(backend, azure_job=azure_job)
+    formatted = job._format_microsoft_results()
+
+    # Qiskit-compatible results drop any outcomes with lost-qubit markers.
+    assert "0120" not in formatted["probabilities"]
+
+    # Remaining probabilities are renormalized over the non-loss mass (0.20 + 0.50).
+    assert formatted["probabilities"]["0100"] == pytest.approx(0.20 / 0.70)
+    assert formatted["probabilities"]["1100"] == pytest.approx(0.50 / 0.70)
+
+    # Counts are computed over the effective number of non-loss shots (100 * 0.70 = 70).
+    assert formatted["counts"]["0100"] == 20
+    assert formatted["counts"]["1100"] == 50
+
+    # Raw probabilities preserve lost-qubit markers.
+    assert formatted["raw_probabilities"]["0120"] == pytest.approx(0.30)
+    assert formatted["raw_probabilities"]["0100"] == pytest.approx(0.20)
+    assert formatted["raw_probabilities"]["1100"] == pytest.approx(0.50)
+    assert formatted["raw_counts"]["0120"] == 30
+    assert formatted["raw_counts"]["0100"] == 20
+
+
+def test_microsoft_v2_results_raw_and_filtered_fields_handle_qubit_loss():
+    ws = create_default_workspace()
+    provider = AzureQuantumProvider(workspace=ws)
+    backend = SimpleNamespace(
+        name="dummy",
+        version="0.0",
+        provider=provider,
+        options=SimpleNamespace(shots=50),
+        configuration=lambda: SimpleNamespace(simulator=False),
+    )
+    azure_job = SimpleNamespace(
+        id="job-2",
+        details=SimpleNamespace(input_params={"shots": 50}),
+        get_results_histogram=lambda: {
+            "[0, 1, 2, 0]": {"count": 30},
+            "[0, 1, 0, 0]": {"count": 20},
+        },
+        get_results_shots=lambda: ["[0, 1, 2, 0]"] * 30 + ["[0, 1, 0, 0]"] * 20,
+    )
+
+    job = AzureQuantumJob(backend, azure_job=azure_job)
+    results = job._translate_microsoft_v2_results()
+
+    assert len(results) == 1
+    total_count, formatted = results[0]
+    # Qiskit-compatible results drop lost-qubit shots.
+    assert total_count == 20
+    assert formatted["probabilities"]["0100"] == pytest.approx(1.0)
+    assert formatted["counts"]["0100"] == 20
+    assert formatted["memory"].count("0100") == 20
+
+    # Raw histogram preserves lost-qubit markers.
+    assert formatted["raw_counts"]["0120"] == 30
+    assert formatted["raw_counts"]["0100"] == 20
+    assert formatted["raw_probabilities"]["0120"] == pytest.approx(0.60)
+    assert formatted["raw_probabilities"]["0100"] == pytest.approx(0.40)
+
+    # Raw per-shot memory keeps the original distinct outcomes.
+    assert formatted["raw_memory"].count("0120") == 30
+    assert formatted["raw_memory"].count("0100") == 20
 
 
 def test_ionq_qir_transpile_decomposes_non_qir_gates():
@@ -382,3 +517,67 @@ def test_qir_target_profile_from_deprecated_target_capability():
     profile = backend._get_target_profile(input_params)
     assert profile == TargetProfile.Base
     assert "target_profile" not in input_params
+
+
+def test_generic_qir_backend_not_created_for_non_qir_target():
+    """Targets without a target_profile (e.g. Pasqal) must not receive an
+    AzureGenericQirBackend — they use pulse-level input formats incompatible
+    with QIR submission.
+
+    The default mock workspace already includes pasqal.sim.emu-tn with
+    target_profile=None via seed_providers in mock_client.py.
+    """
+    from qiskit.providers.exceptions import QiskitBackendNotFoundError
+
+    ws = create_default_workspace()
+    provider = AzureQuantumProvider(workspace=ws)
+
+    with pytest.raises(QiskitBackendNotFoundError):
+        provider.get_backend("pasqal.sim.emu-tn")
+
+
+def test_generic_qir_backend_created_for_unknown_workspace_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _patch_upload_input_data(monkeypatch)
+
+    ws = create_default_workspace()
+    _seed_workspace_target(
+        monkeypatch,
+        ws,
+        provider_id="acme",
+        target_id="acme.qpu",
+        num_qubits=5,
+        target_profile="Adaptive_RI",
+    )
+
+    provider = AzureQuantumProvider(workspace=ws)
+    backend = provider.get_backend("acme.qpu")
+
+    assert isinstance(backend, AzureGenericQirBackend)
+
+    from qsharp import TargetProfile
+
+    assert backend.options.get("target_profile") == TargetProfile.Adaptive_RI
+
+    # Avoid calling `backend.run()` (requires qsharp for QIR generation).
+    input_params = backend._get_input_params({}, shots=11)
+    job = backend._run(
+        job_name="offline-generic",
+        input_data=b"; QIR placeholder",
+        input_params=input_params,
+        metadata={},
+    )
+
+    details = ws._client.services.jobs.get(
+        ws.subscription_id,
+        ws.resource_group,
+        ws.name,
+        job.id(),
+    )
+
+    assert details.provider_id == "acme"
+    assert details.target == "acme.qpu"
+    assert details.input_data_format == "qir.v1"
+    assert details.output_data_format == "microsoft.quantum-results.v2"
+    assert details.input_params["shots"] == 11

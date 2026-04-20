@@ -44,14 +44,28 @@ class QuantinuumTarget(Quantinuum, CirqTarget):
 
     @staticmethod
     def _translate_cirq_circuit(circuit) -> str:
-        """Translate `cirq` circuit to OpenQASM 2.0."""
-        return circuit.to_qasm()
+        """Translate `cirq` circuit to OpenQASM 2.0.
+
+        Note: The Quantinuum targets in this SDK default to
+        `input_data_format="honeywell.openqasm.v1"`, which corresponds to
+        OpenQASM 2.0.
+        """
+        import cirq
+
+        if cirq.is_parameterized(circuit):
+            raise ValueError(
+                "Cannot serialize a parameterized Cirq circuit to OpenQASM 2.0. "
+                "Resolve parameters first (e.g. via cirq.resolve_parameters)."
+            )
+
+        return circuit.to_qasm(version="2.0")
 
     @staticmethod
     def _to_cirq_result(result: Dict[str, Any], param_resolver, **kwargs):
         from cirq import ResultDict
+
         measurements = {
-            key.lstrip("m_"): np.array([[int(_v)] for _v in value])
+            key.removeprefix("m_"): np.array([[int(bit) for bit in _v] for _v in value])
             for key, value in result.items()
             if key.startswith("m_")
         }
@@ -62,18 +76,24 @@ class QuantinuumTarget(Quantinuum, CirqTarget):
         if "measurement_dict" not in azure_job.details.metadata and program is None:
             raise ValueError("Parameter 'measurement_dict' not found in job metadata.")
         measurement_dict = azure_job.details.metadata.get("measurement_dict")
-        return CirqJob(azure_job=azure_job, program=program, measurement_dict=measurement_dict)
+        return CirqJob(
+            azure_job=azure_job,
+            program=program,
+            measurement_dict=measurement_dict,
+            target=self,
+        )
 
     @staticmethod
     def _measurement_dict(program) -> Dict[str, Sequence[int]]:
         """Returns a dictionary of measurement keys to target qubit index."""
         from cirq import MeasurementGate
+
         measurements = [
-            op for op in program.all_operations() if isinstance(op.gate, MeasurementGate)
+            op
+            for op in program.all_operations()
+            if isinstance(op.gate, MeasurementGate)
         ]
-        return {
-            meas.gate.key: [q.x for q in meas.qubits] for meas in measurements
-        }
+        return {meas.gate.key: [q.x for q in meas.qubits] for meas in measurements}
 
     def submit(
         self,
@@ -98,7 +118,7 @@ class QuantinuumTarget(Quantinuum, CirqTarget):
         metadata = {
             "qubits": len(program.all_qubits()),
             "repetitions": repetitions,
-            "measurement_dict": json.dumps(self._measurement_dict(program))
+            "measurement_dict": json.dumps(self._measurement_dict(program)),
         }
         # Override metadata with value from kwargs
         metadata.update(kwargs.get("metadata", {}))
